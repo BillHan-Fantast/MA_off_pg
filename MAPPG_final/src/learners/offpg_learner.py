@@ -209,37 +209,43 @@ class OffPGLearner:
         # inputs for target net
         inputs = []
         # state, obs, action
-        inputs.append(batch["state"][:].unsqueeze(2).unsqueeze(2).repeat(1, 1, self.args.n_sum, self.n_agents, 1))
-        inputs.append(batch["obs"][:].unsqueeze(2).repeat(1, 1, self.args.n_sum, 1, 1))
+        inputs.append(batch["state"][:].unsqueeze(2).repeat(1, 1, self.n_agents, 1))
+        inputs.append(batch["obs"][:])
+        sum_q = mac_out.new_zeros(bs, max_t, 1)
+        sum_pi = mac_out.new_zeros(bs, max_t, 1)
         # Sample n_sum number of possible actions and use importance sampling
-        ac_sampler = Categorical(mac_out.unsqueeze(2).repeat(1, 1, self.args.n_sum, 1, 1) + 1e-10)
-        actions = ac_sampler.sample().long().unsqueeze(4)
-        action_one_hot = mac_out.new_zeros(bs, max_t, self.args.n_sum, self.n_agents, self.n_actions)
-        action_one_hot = action_one_hot.scatter_(-1, actions, 1.0).view(bs, max_t, self.args.n_sum, 1, -1).repeat(1, 1, 1, self.n_agents, 1)
-        agent_mask = (1 - th.eye(self.n_agents, device=batch.device))
-        agent_mask = agent_mask.view(-1, 1).repeat(1, self.n_actions).view(self.n_agents, -1)
-        inputs.append(action_one_hot * (agent_mask.unsqueeze(0).unsqueeze(0).unsqueeze(0)))
+        for _ in range(self.args.n_sum):
+            input = inputs[:]
+            ac_sampler = Categorical(mac_out + 1e-10)
+            actions = ac_sampler.sample().long().unsqueeze(3)
+            action_one_hot = mac_out.new_zeros(bs, max_t, self.n_agents, self.n_actions)
+            action_one_hot = action_one_hot.scatter_(-1, actions, 1.0).view(bs, max_t, 1, -1).repeat(1, 1, self.n_agents, 1)
+            agent_mask = (1 - th.eye(self.n_agents, device=batch.device))
+            agent_mask = agent_mask.view(-1, 1).repeat(1, self.n_actions).view(self.n_agents, -1)
+            input.append(action_one_hot * (agent_mask.unsqueeze(0).unsqueeze(0)))
         # obs last action
-        l_actions = batch["actions_onehot"][:].view(bs, max_t, 1, -1)
-        if self.args.obs_last_action:
-            last_action = []
-            last_action.append(l_actions[:, 0:1])
-            last_action.append(l_actions[:, :-1])
-            last_action = th.cat([x for x in last_action], dim = 1)
-            inputs.append(last_action.unsqueeze(2).repeat(1, 1, self.args.n_sum, self.n_agents, 1))
-
+            l_actions = batch["actions_onehot"][:].view(bs, max_t, 1, -1)
+            if self.args.obs_last_action:
+                last_action = []
+                last_action.append(l_actions[:, 0:1])
+                last_action.append(l_actions[:, :-1])
+                last_action = th.cat([x for x in last_action], dim = 1)
+                input.append(last_action.repeat(1, 1, self.n_agents, 1))
         #agent id
-        inputs.append(th.eye(self.n_agents, device=batch.device).unsqueeze(0).unsqueeze(0).unsqueeze(0).expand(bs, max_t, self.args.n_sum, -1, -1))
-        inputs = th.cat([x for x in inputs], dim=-1)
+            input.append(th.eye(self.n_agents, device=batch.device).unsqueeze(0).unsqueeze(0).expand(bs, max_t, -1, -1))
+            input = th.cat([x for x in input], dim=-1)
         #E(V(s))
-        target_exp_q_vals = self.target_critic.forward(inputs).detach()
-        target_exp_q_vals = th.gather(target_exp_q_vals, 4, actions).squeeze(-1).mean(dim=3)
-        action_mac = mac_out.unsqueeze(2).repeat(1, 1, self.args.n_sum, 1, 1)
-        action_mac = th.gather(action_mac, 4, actions).squeeze(-1)
-        action_mac = th.prod(action_mac, 3)
-        target_exp_q_vals = th.sum(target_exp_q_vals * action_mac, dim=2, keepdim=True) / (th.sum(action_mac, dim=2, keepdim=True) + 1e-10)
+            target_exp_q_vals = self.target_critic.forward(input).detach()
+            target_exp_q_vals = th.gather(target_exp_q_vals, -1, actions).squeeze(-1).mean(dim=-1, keepdim=True)
+
+            action_mac = mac_out[:]
+            action_mac = th.gather(action_mac, -1, actions).squeeze(-1)
+            action_mac = th.prod(action_mac, -1, keepdim=True)
+            sum_q = sum_q + action_mac * target_exp_q_vals
+            sum_pi = sum_pi + action_mac
+        # compute the expected sum
         # target_exp_q_vals = th.sum(target_exp_q_vals, dim=2, keepdim=True) / self.args.n_sum
-        return target_exp_q_vals
+        return sum_q / (sum_pi + 1e-10)
 
 
     def _update_targets(self):
